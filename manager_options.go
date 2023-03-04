@@ -1,4 +1,4 @@
-package go_migrator
+package db_migrator
 
 import "io"
 

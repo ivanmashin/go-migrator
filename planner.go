@@ -1,8 +1,8 @@
-package go_migrator
+package db_migrator
 
 import (
 	"container/list"
-	"github.com/MashinIvan/go-migrator/internal/models"
+	"github.com/Maksumys/db-migrator/internal/models"
 	"sort"
 )
 
@@ -120,7 +120,13 @@ func (p *migratePlanner) planMigrationsRepeatable(plan *migrationsPlan) {
 			continue
 		}
 
-		if !migration.repeatUnconditional && migrationModel.Checksum == migration.checksum {
+		if migration.checkSum == nil {
+			migration.checkSum = func() string {
+				return ""
+			}
+		}
+
+		if !migration.repeatUnconditional && migrationModel.Checksum == migration.checkSum() {
 			p.manager.logger.Printf(
 				"migration (type: %s, version: %s, checksum: %s) checksum not changed, skipping\n",
 				migrationModel.Type, migrationModel.Version, migrationModel.Checksum,

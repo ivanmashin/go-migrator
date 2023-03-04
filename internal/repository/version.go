@@ -1,7 +1,7 @@
 package repository
 
 import (
-	"github.com/MashinIvan/go-migrator/internal/models"
+	"github.com/Maksumys/db-migrator/internal/models"
 	"gorm.io/gorm"
 )
 

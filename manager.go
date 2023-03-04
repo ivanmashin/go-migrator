@@ -1,10 +1,12 @@
-package go_migrator
+package db_migrator
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
-	"github.com/MashinIvan/go-migrator/internal/models"
-	"github.com/MashinIvan/go-migrator/internal/repository"
+	"github.com/Maksumys/db-migrator/internal/models"
+	"github.com/Maksumys/db-migrator/internal/repository"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"hash/fnv"
 	"log"
@@ -19,18 +21,27 @@ var (
 
 // NewMigrationsManager создает экземпляр управляющего миграциями (выступает в качестве фасада).
 // targetVersion - версия, до которой необходимо выполнить миграцию или до которой необоходимо осуществить откат.
-func NewMigrationsManager(db *gorm.DB, targetVersion string, opts ...ManagerOption) (*MigrationManager, error) {
+func NewMigrationsManager(dsn string, targetVersion string, opts ...ManagerOption) (*MigrationManager, error) {
 	target, err := parseVersion(targetVersion)
 	if err != nil {
 		return nil, err
+	}
+
+	db, err := gorm.Open(postgres.New(postgres.Config{
+		DSN:                  dsn,
+		PreferSimpleProtocol: true,
+	}))
+
+	if err != nil {
+		panic(err)
 	}
 
 	manager := MigrationManager{
 		db:                      db,
 		logger:                  log.New(os.Stderr, "", log.LstdFlags),
 		targetVersion:           target,
-		registeredMigrations:    make([]*Migration, 0),
-		registeredMigrationsSet: make(map[uint32]*Migration),
+		registeredMigrations:    make([]*MigrationLite, 0),
+		registeredMigrationsSet: make(map[uint32]*MigrationLite),
 	}
 	for _, opt := range opts {
 		opt(&manager)
@@ -45,14 +56,12 @@ type MigrationManager struct {
 
 	targetVersion Version
 
-	registeredMigrations    []*Migration
-	registeredMigrationsSet map[uint32]*Migration
+	registeredMigrations    []*MigrationLite
+	registeredMigrationsSet map[uint32]*MigrationLite
 }
 
-// RegisterMigration сохраняет миграции в память.
-// По умолчанию миграции осуществляются внутри транзакции.
-//
-// Паникует при регистрации миграций с одинаковымм версией и типом.
+// RegisterMigration
+// deprecated
 func (m *MigrationManager) RegisterMigration(migration *Migration, opts ...MigrationOption) {
 	for _, opt := range opts {
 		opt(migration)
@@ -66,10 +75,52 @@ func (m *MigrationManager) RegisterMigration(migration *Migration, opts ...Migra
 		))
 	}
 
+	migrationLite := &MigrationLite{
+		migrationType:   migration.migrationType,
+		version:         migration.migrator.Version().String(),
+		description:     migration.migrator.Description(),
+		isTransactional: migration.transaction,
+		isAllowFailure:  migration.allowFailure,
+		upF: func(db *sql.DB) error {
+			return migration.migrator.Migrate(m.db)
+		},
+	}
+
+	if versionedMigrator, ok := migration.migrator.(VersionedMigrator); ok {
+		migrationLite.downF = func(db *sql.DB) error {
+			return versionedMigrator.Downgrade(m.db)
+		}
+	} else if repeatableMigrator, ok := migration.migrator.(RepeatableMigrator); ok {
+		migrationLite.checkSum = func() string {
+			return repeatableMigrator.Checksum()
+		}
+	}
+
 	migration.identifier = identifier
-	m.registeredMigrationsSet[identifier] = migration
-	m.registeredMigrations = append(m.registeredMigrations, migration)
+	m.registeredMigrationsSet[identifier] = migrationLite
+	m.registeredMigrations = append(m.registeredMigrations, migrationLite)
 	return
+}
+
+// RegisterLite сохраняет миграции в память.
+// По умолчанию миграции осуществляются внутри транзакции.
+//
+// Паникует при регистрации миграций с одинаковымм версией и типом.
+func (m *MigrationManager) RegisterLite(migrationsStruct ...MigrationLite) {
+	for _, migration := range migrationsStruct {
+		identifier := getMigrationIdentifier(migration.version, string(migration.migrationType))
+		if _, ok := m.registeredMigrationsSet[identifier]; ok {
+			panic(fmt.Sprintf(
+				"Migration with same identifier twice. Type: %s. Identifier: %d",
+				migration.migrationType, identifier,
+			))
+		}
+
+		migration.identifier = identifier
+		m.registeredMigrationsSet[identifier] = &migration
+		m.registeredMigrations = append(m.registeredMigrations, &migration)
+		return
+	}
 }
 
 // CheckFulfillment проверяет корректность установки всех миграций. Проверяется, что нет миграций со статусом
@@ -186,7 +237,7 @@ func (m *MigrationManager) TargetVersionNotLatest() (bool, error) {
 	return false, nil
 }
 
-func (m *MigrationManager) findMigration(migrationModel models.MigrationModel) (*Migration, bool) {
+func (m *MigrationManager) findMigration(migrationModel models.MigrationModel) (*MigrationLite, bool) {
 	migrationModelIdentifier := getMigrationIdentifier(migrationModel.Version, migrationModel.Type)
 
 	for _, migration := range m.registeredMigrations {
@@ -212,7 +263,7 @@ func (m *MigrationManager) getSavedAppVersion() Version {
 	return mustParseVersion(savedAppVersion)
 }
 
-func migrationIsNew(migration *Migration, savedMigrations []models.MigrationModel) bool {
+func migrationIsNew(migration *MigrationLite, savedMigrations []models.MigrationModel) bool {
 	for j, _ := range savedMigrations {
 		savedMigrationIdentifier := getMigrationIdentifier(savedMigrations[j].Version, savedMigrations[j].Type)
 		if migration.identifier == savedMigrationIdentifier {

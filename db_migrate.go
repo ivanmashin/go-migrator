@@ -1,9 +1,10 @@
-package go_migrator
+package db_migrator
 
 import (
+	"errors"
 	"fmt"
-	"github.com/MashinIvan/go-migrator/internal/models"
-	"github.com/MashinIvan/go-migrator/internal/repository"
+	"github.com/Maksumys/db-migrator/internal/models"
+	"github.com/Maksumys/db-migrator/internal/repository"
 	"gorm.io/gorm"
 	"sort"
 )
@@ -56,7 +57,7 @@ func (m *MigrationManager) Migrate() error {
 		}
 
 		err = m.executeMigration(migrationModel, migration)
-		if err != nil && !migration.allowFailure {
+		if err != nil && !migration.isAllowFailure {
 			err = repository.UpdateMigrationState(m.db, &migrationModel, models.StateFailure)
 			if err != nil {
 				return err
@@ -113,23 +114,23 @@ func (m *MigrationManager) saveNewMigrations() ([]models.MigrationModel, error) 
 	}
 
 	maxRank := 0
-	for i, _ := range savedMigrations {
+	for i := range savedMigrations {
 		if rank := savedMigrations[i].Rank; rank > maxRank {
 			maxRank = rank
 		}
 	}
 
-	newMigrations := make([]*Migration, 0, len(m.registeredMigrations))
-	for i, _ := range m.registeredMigrations {
+	newMigrations := make([]*MigrationLite, 0, len(m.registeredMigrations))
+	for i := range m.registeredMigrations {
 		if migrationIsNew(m.registeredMigrations[i], savedMigrations) {
 			newMigrations = append(newMigrations, m.registeredMigrations[i])
 		}
 	}
 
 	// запрет на сохранение миграций с версией, которая ниже максимальной версии из уже загерисрированных миграций
-	for i, _ := range newMigrations {
+	for i := range newMigrations {
 		versionIncorrect := false
-		for j, _ := range savedMigrations {
+		for j := range savedMigrations {
 			versionSaved := mustParseVersion(savedMigrations[j].Version)
 			versionToSave := mustParseVersion(newMigrations[i].version)
 
@@ -146,19 +147,26 @@ func (m *MigrationManager) saveNewMigrations() ([]models.MigrationModel, error) 
 	}
 
 	sort.SliceStable(newMigrations, func(i, j int) bool {
-		leftVersioned := m.registeredMigrations[i].migrator.Version()
-		rightVersioned := m.registeredMigrations[j].migrator.Version()
+		leftVersioned, err := parseVersion(m.registeredMigrations[i].version)
+		if err != nil {
+			panic(err)
+		}
+
+		rightVersioned, err := parseVersion(m.registeredMigrations[j].version)
+		if err != nil {
+			panic(err)
+		}
 
 		return leftVersioned.LessThan(rightVersioned)
 	})
 
 	err = m.db.Transaction(func(tx *gorm.DB) error {
-		for i, _ := range newMigrations {
+		for i := range newMigrations {
 			migration, err := repository.SaveMigration(tx, repository.SaveMigrationRequest{
 				Rank:        maxRank + (i + 1),
 				Type:        string(newMigrations[i].migrationType),
 				Version:     newMigrations[i].version,
-				Description: newMigrations[i].migrator.Description(),
+				Description: newMigrations[i].description,
 				State:       models.StateRegistered,
 			})
 			if err != nil {
@@ -176,21 +184,46 @@ func (m *MigrationManager) saveNewMigrations() ([]models.MigrationModel, error) 
 	return savedMigrations, nil
 }
 
-func (m *MigrationManager) executeMigration(migrationModel models.MigrationModel, migration *Migration) error {
+func (m *MigrationManager) executeMigration(migrationModel models.MigrationModel, migration *MigrationLite) error {
 	m.logger.Printf(
 		"Executing %s migration: version %s. State: %s\n",
 		migrationModel.Type, migrationModel.Version, migrationModel.State,
 	)
 
-	var err error
-	if migration.transaction {
-		err = m.db.Transaction(migration.migrator.Migrate)
-	} else {
-		err = migration.migrator.Migrate(m.db)
+	if len(migration.up) == 0 && migration.upF == nil || len(migration.up) > 0 && migration.upF != nil {
+		return errors.New("fail to migrate, because up and upf is empty or both is not nil")
 	}
-	if err != nil {
-		m.logger.Println("Error occurred on migrate:", err)
-		return err
+
+	if migration.isTransactional {
+		err := m.db.Transaction(func(tx *gorm.DB) error {
+			if len(migration.up) > 0 {
+				return tx.Exec(migration.up).Error
+			} else {
+				db, err := tx.DB()
+				if err != nil {
+					return err
+				}
+				return migration.upF(db)
+			}
+		})
+
+		if err != nil {
+			return err
+		}
+	} else {
+		db, err := m.db.DB()
+		if err != nil {
+			return err
+		}
+
+		if len(migration.up) > 0 {
+			_, err = db.Exec(migration.up)
+			if err != nil {
+				return err
+			}
+		} else {
+			return migration.upF(db)
+		}
 	}
 
 	m.logger.Println("Migration Complete")
@@ -200,7 +233,7 @@ func (m *MigrationManager) executeMigration(migrationModel models.MigrationModel
 func (m *MigrationManager) saveStateOnSuccessfulMigration(
 	savedMigrations []models.MigrationModel,
 	migrationModel models.MigrationModel,
-	migration *Migration,
+	migration *MigrationLite,
 ) error {
 	switch migration.migrationType {
 	case TypeVersioned:
@@ -216,7 +249,7 @@ func (m *MigrationManager) saveStateOnSuccessfulMigration(
 		}
 
 		// все миграции до текущей TypeBaseline помечаем как пропущенные
-		for i, _ := range savedMigrations {
+		for i := range savedMigrations {
 			if migrationModel.Id == savedMigrations[i].Id {
 				break
 			}
@@ -228,7 +261,13 @@ func (m *MigrationManager) saveStateOnSuccessfulMigration(
 		}
 	}
 
-	err := repository.UpdateMigrationStateExecuted(m.db, &migrationModel, models.StateSuccess, migration.checksum)
+	if migration.checkSum == nil {
+		migration.checkSum = func() string {
+			return ""
+		}
+	}
+
+	err := repository.UpdateMigrationStateExecuted(m.db, &migrationModel, models.StateSuccess, migration.checkSum())
 	if err != nil {
 		return err
 	}

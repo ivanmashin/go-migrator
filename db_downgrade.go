@@ -1,9 +1,10 @@
-package go_migrator
+package db_migrator
 
 import (
 	"fmt"
-	"github.com/MashinIvan/go-migrator/internal/models"
-	"github.com/MashinIvan/go-migrator/internal/repository"
+	"github.com/Maksumys/db-migrator/internal/models"
+	"github.com/Maksumys/db-migrator/internal/repository"
+	"gorm.io/gorm"
 	"sort"
 )
 
@@ -69,34 +70,64 @@ func (m *MigrationManager) planDowngrade() (migrationsPlan, error) {
 	return planner.MakePlan(), nil
 }
 
-func (m *MigrationManager) executeDowngrade(migrationModel models.MigrationModel, migration *Migration) error {
+func (m *MigrationManager) executeDowngrade(migrationModel models.MigrationModel, migration *MigrationLite) error {
 	m.logger.Printf(
 		"Downgrading %s migration: version %s. State: %s\n",
 		migrationModel.Type, migrationModel.Version, migrationModel.State,
 	)
 
-	versionedMigrator, ok := migration.migrator.(VersionedMigrator)
-	if !ok {
+	if migration.migrationType != TypeVersioned {
 		panic("versioned migration must satisfy VersionedMigrator interface")
 	}
-
-	var err error
-	if migration.transaction {
-		err = m.db.Transaction(versionedMigrator.Downgrade)
-	} else {
-		err = versionedMigrator.Downgrade(m.db)
+	if len(migration.down) == 0 && migration.downF == nil {
+		panic("fail to downgrade, because down and downF is empty")
 	}
-	if err != nil {
-		m.logger.Println("Error occurred on migrate:", err)
-		return err
+
+	if migration.isTransactional {
+		err := m.db.Transaction(func(tx *gorm.DB) error {
+			if len(migration.down) > 0 {
+				return tx.Exec(migration.down).Error
+			} else {
+				db, err := tx.DB()
+				if err != nil {
+					return err
+				}
+				return migration.downF(db)
+			}
+		})
+
+		if err != nil {
+			m.logger.Println("Error occurred on migrate:", err)
+			return err
+		}
+	} else {
+		db, err := m.db.DB()
+		if err != nil {
+			return err
+		}
+
+		if len(migration.down) > 0 {
+			_, err = db.Exec(migration.down)
+			if err != nil {
+				return err
+			}
+		} else {
+			return migration.downF(db)
+		}
 	}
 
 	m.logger.Println("Downgrade complete")
 	return nil
 }
 
-func (m *MigrationManager) saveStateAfterDowngrading(savedMigrations []models.MigrationModel, migrationModel models.MigrationModel, migration *Migration) error {
-	err := repository.UpdateMigrationStateExecuted(m.db, &migrationModel, models.StateUndone, migration.checksum)
+func (m *MigrationManager) saveStateAfterDowngrading(savedMigrations []models.MigrationModel, migrationModel models.MigrationModel, migration *MigrationLite) error {
+	if migration.checkSum == nil {
+		migration.checkSum = func() string {
+			return ""
+		}
+	}
+
+	err := repository.UpdateMigrationStateExecuted(m.db, &migrationModel, models.StateUndone, migration.checkSum())
 	if err != nil {
 		return err
 	}
