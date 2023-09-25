@@ -12,6 +12,7 @@ import (
 )
 
 var (
+	ErrNoSuccessfulBaseline     = errors.New("no baseline migration was found, consider migrating")
 	ErrHasForthcomingMigrations = errors.New("found not completed forthcoming migrations, consider migrating")
 	ErrHasFailedMigrations      = errors.New("found failed migrations, consider fixing your db")
 	ErrTargetVersionNotLatest   = errors.New("target version falls behind migrations, consider raising target version")
@@ -138,7 +139,24 @@ func (m *MigrationManager) HasForthcomingMigrations() (bool, error) {
 		return false, err
 	}
 
+	hasSuccessfulBaseline := false
+
+	for _, migration := range savedMigrations {
+		if migration.Type == string(TypeBaseline) && migration.State == models.StateSuccess {
+			hasSuccessfulBaseline = true
+			break
+		}
+	}
+
+	if !hasSuccessfulBaseline {
+		return true, ErrNoSuccessfulBaseline
+	}
+
 	for i, _ := range savedMigrations {
+		if savedMigrations[i].Type == string(TypeBaseline) {
+			continue
+		}
+
 		migrationVersion := mustParseVersion(savedMigrations[i].Version)
 		if migrationVersion.MoreOrEqual(savedVersion) && savedMigrations[i].State != models.StateSuccess {
 			return true, nil
